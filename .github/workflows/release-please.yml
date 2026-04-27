@@ -32,11 +32,28 @@ jobs:
         with:
           token: "${{ steps.app-token.outputs.token }}"
 
+      # Extract the PR branch name into a plain-string step output. Doing this in a gated
+      # `run:` block (instead of `fromJson()` inside `env:`/`with:`) avoids the eager
+      # template evaluation that fails with "Error reading JToken from JsonReader" when
+      # outputs.pr is empty (i.e. when prs_created == 'false').
+      - name: Read release PR branch name
+        id: pr-meta
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        env:
+          PR_JSON: ${{ steps.release.outputs.pr }}
+        run: |
+          BRANCH=$(printf '%s' "$PR_JSON" | jq -r '.headBranchName // empty')
+          if [ -z "$BRANCH" ]; then
+            echo "Could not extract headBranchName from release-please pr output"
+            exit 1
+          fi
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
       - name: Checkout release PR branch
         if: ${{ steps.release.outputs.prs_created == 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+          ref: ${{ steps.pr-meta.outputs.branch }}
           path: pr-checkout
           persist-credentials: false
 
@@ -44,7 +61,7 @@ jobs:
         if: ${{ steps.release.outputs.prs_created == 'true' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          BRANCH: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+          BRANCH: ${{ steps.pr-meta.outputs.branch }}
         working-directory: pr-checkout
         run: |
           NEW_VERSION=$(awk -F= '/^VERSION=/ { gsub(/[^0-9.]/, "", $2); print $2; exit }' Makefile)
