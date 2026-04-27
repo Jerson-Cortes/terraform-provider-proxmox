@@ -6,11 +6,16 @@ on:
       - main
   workflow_dispatch: {}
 
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
 jobs:
   release-please:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Generate Short Lived OAuth App Token
         uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
@@ -27,27 +32,35 @@ jobs:
         with:
           token: "${{ steps.app-token.outputs.token }}"
 
+      - name: Checkout release PR branch
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+          path: pr-checkout
+          persist-credentials: false
+
       - name: Sync context7.json on release PR
         if: ${{ steps.release.outputs.prs_created == 'true' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BRANCH: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+        working-directory: pr-checkout
         run: |
-          PR_JSON='${{ steps.release.outputs.pr }}'
-          BRANCH=$(echo "$PR_JSON" | jq -r '.headBranchName // empty')
-          if [ -z "$BRANCH" ]; then
-            echo "No release PR JSON in outputs; skipping"
-            exit 0
-          fi
-          REPO="${{ github.repository }}"
-
-          git clone --branch "$BRANCH" --depth 2 \
-            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" pr-checkout
-          cd pr-checkout
-
           NEW_VERSION=$(awk -F= '/^VERSION=/ { gsub(/[^0-9.]/, "", $2); print $2; exit }' Makefile)
           if [ -z "$NEW_VERSION" ]; then
             echo "Could not parse VERSION from Makefile; skipping"
             exit 0
+          fi
+
+          # context7.json is NOT in release-please-config.json's extra-files list, so
+          # release-please does not touch it. This step is the sole updater: it bumps
+          # .previousVersions[0] to the upcoming release tag (read from Makefile, which
+          # release-please bumps via release-type: go) so Context7 indexes that version
+          # as the latest historical snapshot once the release PR merges.
+          if ! jq -e '(.previousVersions // []) | length > 0' context7.json >/dev/null; then
+            echo "context7.json has no previousVersions[0] to update; aborting"
+            exit 1
           fi
 
           jq --arg t "v$NEW_VERSION" --arg ver "$NEW_VERSION" \
@@ -60,23 +73,37 @@ jobs:
             exit 0
           fi
 
+          # Resolve the bot's user id for the DCO Signed-off-by trailer (committer email
+          # follows GitHub's <id>+<slug>[bot]@users.noreply.github.com convention).
           APP_SLUG="${{ steps.app-token.outputs.app-slug }}"
           BOT_USER_ID=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
-          git config user.name "${APP_SLUG}[bot]"
-          git config user.email "${BOT_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+          if [ -z "$BOT_USER_ID" ]; then
+            echo "Could not resolve bot user id for ${APP_SLUG}[bot]"
+            exit 1
+          fi
 
-          git add context7.json
-          git commit -s -m "chore: bump context7.json to v$NEW_VERSION"
-          git push origin "$BRANCH"
+          # Commit via the GitHub API so the result is Verified-signed by GitHub and the
+          # committer is the app's bot user — no GPG key or git config required. The
+          # Signed-off-by trailer preserves DCO compliance in case the DCO check is not
+          # configured to auto-exempt [bot] authors.
+          COMMIT_MSG=$(printf 'chore(docs): bump context7.json to v%s\n\nSigned-off-by: %s[bot] <%s+%s[bot]@users.noreply.github.com>' \
+            "$NEW_VERSION" "$APP_SLUG" "$BOT_USER_ID" "$APP_SLUG")
+          CONTENT=$(base64 -w0 context7.json)
+          SHA=$(gh api "/repos/${GITHUB_REPOSITORY}/contents/context7.json?ref=${BRANCH}" --jq .sha)
+          gh api -X PUT "/repos/${GITHUB_REPOSITORY}/contents/context7.json" \
+            -f message="$COMMIT_MSG" \
+            -f content="$CONTENT" \
+            -f branch="$BRANCH" \
+            -f sha="$SHA" >/dev/null
 
       - name: Checkout
-        if: ${{ steps.release.outputs.release_created }}
+        if: ${{ steps.release.outputs.release_created == 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
 
       - name: Add contributors to release
-        if: ${{ steps.release.outputs.release_created }}
+        if: ${{ steps.release.outputs.release_created == 'true' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -88,23 +115,31 @@ jobs:
             exit 0
           fi
 
-          # Get PR numbers from commits between tags
-          PR_NUMBERS=$(git log ${PREV_TAG}..${TAG} --oneline | grep -oE '#[0-9]+' | tr -d '#' | sort -u)
+          # Extract PR numbers from squash-merge subjects ("subject (#NN)") only — anchored
+          # to end-of-line so issue refs like "fixes #123" inside a subject are ignored.
+          PR_NUMBERS=$(git log "${PREV_TAG}..${TAG}" --format='%s' \
+            | grep -oE '\(#[0-9]+\)$' | tr -d '(#)' | sort -u)
 
-          # Get unique contributors from PRs (excluding bots), sorted alphabetically
+          # Resolve unique non-bot contributors, sorted alphabetically. Bot detection: GitHub
+          # bot logins end in "[bot]"; the "app/" prefix covers the legacy GitHub App identity
+          # form some endpoints still emit.
           CONTRIBUTORS=$(for pr in $PR_NUMBERS; do
-            gh pr view $pr --json author -q '.author.login' 2>/dev/null
-          done | sort -u | grep -v 'bot' | grep -v '^app/' | grep -v '^$')
+            gh pr view "$pr" --json author -q '.author.login' 2>/dev/null || true
+          done | grep -vE '\[bot\]$|^app/|^$' | sort -u)
 
           if [ -z "$CONTRIBUTORS" ]; then
             echo "No contributors found"
             exit 0
           fi
 
-          # Format as bullet point list
-          LINKS=$(echo "$CONTRIBUTORS" | sed 's/.*/* [@&](https:\/\/github.com\/&)/')
-
-          # Append contributors to release body
           gh release view "$TAG" --json body -q .body > /tmp/body.md
+
+          # Idempotent: skip if a Contributors section is already present (e.g. workflow rerun).
+          if grep -q '^### Contributors' /tmp/body.md; then
+            echo "Release body already has Contributors section; skipping"
+            exit 0
+          fi
+
+          LINKS=$(echo "$CONTRIBUTORS" | sed 's/.*/* [@&](https:\/\/github.com\/&)/')
           printf '\n### Contributors\n\n%s\n' "$LINKS" >> /tmp/body.md
           gh release edit "$TAG" --notes-file /tmp/body.md
