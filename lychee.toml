@@ -9,7 +9,9 @@ exclude_path = [
     "cache",
     ".terraform",
     ".github/PULL_REQUEST_TEMPLATE.md",
-    ".claude"
+    ".claude",
+    ".dev",
+    "build"
 ]
 
 # Exclude URL patterns (regex)
@@ -24,3 +26,8 @@ verbose = "warn"
 no_progress = true
 
 accept = [429, 200]
+
+# GitHub occasionally returns 502 under concurrent requests; retry more aggressively
+# before failing the job.
+max_retries = 5
+retry_wait_time = 2
