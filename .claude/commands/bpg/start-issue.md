@@ -317,6 +317,12 @@ commands in this skill must operate inside the worktree directory (use absolute 
 `cd $WORKTREE_PATH && …` per Bash call — shell state does not persist across calls). Skip the
 rest of this section.
 
+**Worktree upstream check still required.** After the worktree skill creates the branch,
+verify `git -C "$WORKTREE_PATH" branch -vv | grep "^\* "` does NOT show `[origin/main]`.
+If it does, run `git -C "$WORKTREE_PATH" branch --unset-upstream` before any push attempt.
+The same `feedback-never-push-to-main.md` failure mode applies regardless of how the branch
+was created.
+
 ### Branch-in-place path
 
 Pre-flight: refuse to clobber any local work (modified, staged, OR untracked):
@@ -349,13 +355,42 @@ AskUserQuestion(
 )
 ```
 
-- "Switch to it": `git checkout "<BRANCH_NAME>"`
+- "Switch to it": `git checkout "<BRANCH_NAME>"` — then verify upstream (see below).
 - "Create new": ask for a new name or append a numeric suffix.
 
 If the branch doesn't exist, create it from the chosen base:
 
 ```bash
-git checkout -b "<BRANCH_NAME>" <BASE_REF>
+git checkout -b "<BRANCH_NAME>" --no-track <BASE_REF>
+```
+
+**`--no-track` is non-negotiable.** Without it, `git checkout -b NEW_BRANCH origin/main`
+implicitly sets the new branch's upstream to `origin/main`. A subsequent bare `git push`,
+`git push origin HEAD`, or `git push -u origin HEAD` can then resolve the remote ref via
+that tracking config and land the feature branch's commits **directly on `main`**. This has
+happened in this repo (post-mortem in `feedback-never-push-to-main.md`). `--no-track`
+ensures the branch starts with no upstream; the first push must explicitly name the target
+remote ref via `-u origin "<BRANCH_NAME>:<BRANCH_NAME>"`, which is the safe form.
+
+**Verify immediately after creating the branch:**
+
+```bash
+git branch -vv | grep "^\* "
+```
+
+The output line for the current branch must NOT contain `[origin/main]`. If it does,
+something failed — STOP, run `git branch --unset-upstream`, and notify the user before
+proceeding.
+
+**Switch-to-it path:** if the user picked "Switch to it" on an existing branch above, run
+the same verify step. If the existing branch was created without `--no-track` previously,
+it may still have `origin/main` as upstream — unset it before continuing:
+
+```bash
+git checkout "<BRANCH_NAME>"
+git branch -vv | grep "^\* "
+# If the line shows [origin/main], unset:
+# git branch --unset-upstream
 ```
 
 ## Setup 5: Create Session State File
@@ -459,6 +494,53 @@ If "Run /bpg:investigate now": tell the user to invoke `/bpg:investigate <ISSUE_
 slash command cannot invoke another slash command directly — only the user can). If "Pause
 here": exit cleanly. Either way, do NOT begin investigation work in this skill.
 
+## Push hygiene (read once, apply on every push later in the workflow)
+
+This skill creates the branch but does NOT push. Pushes happen later in `/bpg:prepare-pr` or
+manually. Even though `--no-track` was used at creation, follow these rules on every future
+push to make accidents impossible:
+
+1. **Always verify tracking immediately before pushing:**
+
+   ```bash
+   git branch -vv | grep "^\* "
+   ```
+
+   The current-branch line must NOT show `[origin/main]`. If it does, STOP and run
+   `git branch --unset-upstream` before pushing.
+
+2. **Only push with an explicit `<local>:<remote>` refspec.** The safe forms (in priority
+   order):
+
+   ```bash
+   # Best: explicit refspec, both sides named
+   git push -u origin "<BRANCH_NAME>:<BRANCH_NAME>"
+
+   # Acceptable: HEAD with explicit refs/heads/ on the remote side
+   git push -u origin "HEAD:refs/heads/<BRANCH_NAME>"
+   ```
+
+3. **Forbidden push forms** (all carry the risk of landing on `main`):
+
+   ```bash
+   git push                    # forbidden — relies on push.default
+   git push origin             # forbidden
+   git push origin HEAD        # forbidden — remote ref resolved via tracking config
+   git push -u origin HEAD     # forbidden — same risk surface
+   ```
+
+4. **Verify after pushing:**
+
+   ```bash
+   git ls-remote origin "<BRANCH_NAME>"
+   ```
+
+   This MUST print a line for the branch. If `main` advanced unexpectedly, stop and notify
+   the user immediately — do NOT attempt to fix without explicit instruction.
+
+5. **PR creation:** `gh pr create --head "<BRANCH_NAME>"` — pass `--head` explicitly; do not
+   rely on the inferred branch.
+
 </process>
 
 <success_criteria>
@@ -475,6 +557,8 @@ complete until all of these are true:
 - [ ] Working tree clean (branch-in-place path) OR worktree created
 - [ ] Branch based on `origin/main` (or alternate base verified with `git rev-parse --verify`)
 - [ ] Branch created with correct naming: `{type}/{issue}-{description}`
+- [ ] Branch created with `--no-track` (or upstream explicitly unset post-checkout) — verified
+      via `git branch -vv | grep "^\* "` showing NO `[origin/main]` on the current branch line
 - [ ] `.dev/` directory exists
 - [ ] Session state template exists
 - [ ] Session state file created: `.dev/{issue}_SESSION_STATE.md`
@@ -501,5 +585,8 @@ criteria. This skill's contract ends with "workspace ready, hand-off prompt issu
   stomp each other's logs. Run `/bpg:debug-api` per-issue to avoid confusion
 - After this skill completes, run `/bpg:investigate <ISSUE_NUM>` to start the investigation
   gate. Use `/bpg:resume` to come back to a paused session later
+- The "Push hygiene" section near the end of `<process>` is **mandatory reading** before any
+  `git push` later in the workflow. It is the only thing standing between your feature
+  branch's commits and an accidental landing on `origin/main`
 
 </tips>
